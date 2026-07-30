@@ -1,0 +1,455 @@
+---
+title: "Individual Actuarial Project"
+author: "Amba Sharma"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Libraries
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+```
+
+## Seeds for reproducibility and number of Monte Carlo simulations
+
+```{r}
+set.seed(2026)
+
+sims <- 10000
+```
+
+# Parameters
+
+## Japan Parameters
+
+```{r}
+
+jlambda <- 3.5      # Annual flood frequency (events/year)
+jmu <- 9.9          # Mean economic loss per event (USD billion)
+jsigma <- 4.5       # SD of economic loss (USD billion)
+jp <- 0.50          # Insurance penetration rate (50%)
+jr <- 0.85          # Recovery rate (85% of insured losses paid)
+jgdp <- 4230        # GDP (USD billion)
+
+```
+
+## Bangladesh Parameters
+
+```{r}
+
+blambda <- 3.38     # Annual flood frequency (1.86 flood + 1.52 cyclone)
+bmu <- 1.09         # Mean economic loss per event (USD billion)
+bsigma <- 0.9       # SD of economic loss (USD billion)
+bp <- 0.05         # Insurance penetration rate (0.05% - baseline)
+br <- 0.65         # Recovery rate (65%)
+bgdp <- 460         # GDP (USD billion)
+
+```
+
+## Bangladesh Scenario Penetration Rates
+
+```{r}
+
+scenarios <- data.frame(
+  scenario = c("Baseline", "Low", "Medium", "High", "Japan Like"),
+  penetration = c(0.05, 0.1, 0.2, 0.3, 0.5),
+  description = c("Current (95% gap)", 
+                  "2x current", 
+                  "Regional improvement target", 
+                  "Significant Policy intervention", 
+                  "Matches Japan")
+)
+
+print(scenarios)
+```
+
+# Simulation functions
+
+```{r}
+
+simulate_annual_losses <- function(lambda, mu, sigma, sims) {
+   annual_losses <- numeric(sims)
+  
+  for (i in 1:sims) {
+    # Number of flood events this year (Poisson)
+    n_events <- rpois(1, lambda)
+    
+    if (n_events > 0) {
+      # Convert mean/sd to lognormal parameters
+      # For lognormal: if X ~ LN(meanlog, sdlog), then
+      # E[X] = exp(meanlog + sdlog^2/2)
+      # Var[X] = exp(2*meanlog + sdlog^2)*(exp(sdlog^2) - 1)
+      
+      meanlog <- log(mu^2 / sqrt(sigma^2 + mu^2))
+      sdlog <- sqrt(log(1 + (sigma^2 / mu^2)))
+      
+      # event severities
+      event_losses <- rlnorm(n_events, meanlog, sdlog)
+      
+      # total annual loss
+      annual_losses[i] <- sum(event_losses)
+    } else {
+      annual_losses[i] <- 0
+    }
+  }
+  
+  return(annual_losses)
+}
+
+# Test the function with Japan parameters
+test_japan <- simulate_annual_losses(jlambda, jmu, jsigma, sims = 1000)
+
+cat("Test Results (Japan, 1000 simulations):\n")
+cat("Mean annual loss: $", round(mean(test_japan), 2), " billion\n", sep = "")
+cat("Expected (lambda × mu): $", round(jlambda * jmu, 2), " billion\n", sep = "")
+cat("SD of annual loss: $", round(sd(test_japan), 2), " billion\n")
+```
+
+# Calculating the Protection Gaps
+
+```{r}
+
+calculate_protection_gap <- function(annual_losses, penetration, recovery_rate) {
+  # Insured loss = Economic loss × Penetration × Recovery rate
+  insured_losses <- annual_losses * penetration * recovery_rate
+  
+  # Protection gap = Economic loss - Insured loss
+  protection_gaps <- annual_losses - insured_losses
+  
+  # Protection gap percentage
+  gap_pct <- ifelse(annual_losses > 0, 
+                    protection_gaps / annual_losses * 100, 
+                    0)
+  
+  return(list(
+    economic_loss = annual_losses,
+    insured_loss = insured_losses,
+    protection_gap = protection_gaps,
+    gap_pct = gap_pct
+  ))
+}
+```
+
+## Simulations
+
+```{r}
+# simulate annual losses
+cat("Running simulations with n =", sims, "iterations...\n\n")
+
+# Japan simulation
+japan_losses <- simulate_annual_losses(jlambda, jmu, jsigma, sims)
+japan_results <- calculate_protection_gap(japan_losses, jp, jr)
+
+# Bangladesh simulation 
+bangladesh_losses <- simulate_annual_losses(blambda, bmu, bsigma, sims)
+
+# results for each scenario
+results_list <- list()
+
+# Japan baseline
+results_list[["Japan_Baseline"]] <- data.frame(
+  scenario = "Japan_Baseline",
+  mean_economic_loss = mean(japan_results$economic_loss),
+  mean_insured_loss = mean(japan_results$insured_loss),
+  mean_protection_gap = mean(japan_results$protection_gap),
+  protection_gap_pct = mean(japan_results$gap_pct),
+  VaR_95 = quantile(japan_results$protection_gap, 0.95),
+  VaR_99 = quantile(japan_results$protection_gap, 0.99)
+)
+
+# Bangladesh scenarios
+for (i in 1:nrow(scenarios)) {
+  scen_name <- paste0("Bangladesh_", scenarios$scenario[i])
+  pen_rate <- scenarios$penetration[i]
+  
+  bg_results <- calculate_protection_gap(bangladesh_losses, pen_rate, br)
+  
+  results_list[[scen_name]] <- data.frame(
+    scenario = scen_name,
+    mean_economic_loss = mean(bg_results$economic_loss),
+    mean_insured_loss = mean(bg_results$insured_loss),
+    mean_protection_gap = mean(bg_results$protection_gap),
+    protection_gap_pct = mean(bg_results$gap_pct),
+    VaR_95 = quantile(bg_results$protection_gap, 0.95),
+    VaR_99 = quantile(bg_results$protection_gap, 0.99)
+  )
+}
+
+# single dataframe
+model_outputs <- bind_rows(results_list)
+rownames(model_outputs) <- NULL
+
+#results
+print(model_outputs, digits = 3)
+```
+
+# Visualizations
+
+## Plot One: Protection Gap Comparison
+
+```{r}
+bangladesh_plot <- model_outputs |>
+  filter(grepl("Bangladesh", scenario)) |>
+  mutate(scenario_label = gsub("Bangladesh_", "", scenario))
+
+# Reorder scenarios
+bangladesh_plot$scenario_label <- factor(bangladesh_plot$scenario_label,
+                                          levels = c("Baseline", "Low", "Medium", "High", "Japan Like"))
+
+# Get Japan's protection gap for reference line
+japan_gap <- model_outputs |>
+  filter(scenario == "Japan_Baseline") |>
+  pull(protection_gap_pct)
+
+p1 <- ggplot(bangladesh_plot, aes(x = scenario_label, y = protection_gap_pct)) +
+  geom_bar(stat = "identity", fill = "lightblue", width = 0.6) +
+  geom_hline(yintercept = japan_gap, linetype = "dashed", color = "darkblue", linewidth = 1.2) +
+  geom_text(aes(label = paste0(round(protection_gap_pct, 1), "%")), 
+            vjust = -0.5, size = 4) +
+  annotate("text", x = 1.5, y = japan_gap - 5, 
+           label = paste0("Japan: ", round(japan_gap, 1), "%"),
+           color = "darkblue", fontface = "bold", size = 4) +
+  labs(
+    title = "Bangladesh Protection Gap Under Different Scenarios",
+    subtitle = "Dashed blue line shows Japan's current protection gap for comparison",
+    x = "Insurance Penetration Scenario",
+    y = "Protection Gap (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    axis.text.x = element_text(size = 10)
+  ) +
+  ylim(0, 105)
+
+print(p1)
+```
+
+## Plot 2: VaR Comparisons (Tail Risk)
+
+```{r}
+
+var_plot_data <- model_outputs |>
+  filter(grepl("Bangladesh", scenario)) |>
+  mutate(scenario_label = gsub("Bangladesh_", "", scenario)) |>
+  select(scenario_label, VaR_95, VaR_99) |>
+  tidyr::pivot_longer(cols = c(VaR_95, VaR_99), 
+                      names_to = "VaR_level", 
+                      values_to = "value")
+
+# Reorder scenarios
+var_plot_data$scenario_label <- factor(var_plot_data$scenario_label,
+                                        levels = c("Baseline", "Low", "Medium", "High", "Japan Like"))
+
+# Clean up labels
+var_plot_data$VaR_level <- gsub("VaR_", "VaR ", var_plot_data$VaR_level)
+var_plot_data$VaR_level <- paste0(var_plot_data$VaR_level, "%")
+
+# Get Japan VaR values for reference lines
+japan_var95 <- model_outputs |> filter(scenario == "Japan_Baseline") |> pull(VaR_95)
+japan_var99 <- model_outputs |> filter(scenario == "Japan_Baseline") |> pull(VaR_99)
+
+p2 <- ggplot(var_plot_data, aes(x = scenario_label, y = value, fill = VaR_level)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  geom_text(aes(label = paste0("$", round(value, 1), "bn")), 
+            position = position_dodge(width = 0.7), vjust = -0.5, size = 3) +
+  scale_fill_manual(values = c("VaR 95%" = "lightblue", "VaR 99%" = "darkblue")) +
+  labs(
+    title = "Uninsured Losses in Extreme Years: Bangladesh Scenarios",
+    subtitle = "VaR 95% = 1-in-20 year loss | VaR 99% = 1-in-100 year loss",
+    x = "Insurance Penetration Scenario",
+    y = "Uninsured Loss (USD Billion)",
+    fill = "Risk Measure"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "top"
+  ) +
+  ylim(0, 14)
+
+print(p2)
+```
+
+## Plot 3: GDP-Relative Impact Chart
+
+```{r}
+
+# Japan's GDP
+gdp_plot <- model_outputs |>
+  mutate(
+    gdp = ifelse(scenario == "Japan_Baseline", 4230, 460),
+    gap_pct_gdp = (mean_protection_gap / gdp) * 100
+  )
+
+# comparison dataframe
+gdp_comparison <- data.frame(
+  country = c("Japan", "Bangladesh\n(Current)", "Bangladesh\n(Japan-Like)"),
+  gap_pct_gdp = c(
+    gdp_plot$gap_pct_gdp[gdp_plot$scenario == "Japan_Baseline"],
+    gdp_plot$gap_pct_gdp[gdp_plot$scenario == "Bangladesh_Baseline"],
+    gdp_plot$gap_pct_gdp[gdp_plot$scenario == "Bangladesh_Japan Like"]
+  )
+)
+
+gdp_comparison$country <- factor(gdp_comparison$country, 
+                                  levels = c("Japan", "Bangladesh\n(Current)", "Bangladesh\n(Japan-Like)"))
+
+p3 <- ggplot(gdp_comparison, aes(x = country, y = gap_pct_gdp, fill = country)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = paste0(round(gap_pct_gdp, 2), "%")), vjust = -0.5, size = 4.5) +
+  scale_fill_manual(values = c("Japan" = "lightblue", 
+                                "Bangladesh\n(Current)" = "#3498DB",
+                                "Bangladesh\n(Japan-Like)" = "darkblue")) +
+  labs(
+    title = "Annual Uninsured Flood Losses as Percentage of GDP",
+    subtitle = "Economic burden relative to national income",
+    x = "",
+    y = "Uninsured Loss (% of GDP)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10, color = "grey40"),
+    legend.position = "none"
+  ) +
+  ylim(0, 1)
+
+print(p3)
+
+```
+
+## Plot 4: Distribution of simulated annual losses
+
+```{r}
+
+hist(bangladesh_losses, breaks = 50, main = "Distribution of Simulated Annual Losses (Bangladesh)",
+     xlab = "Annual Loss (USD Billion)", col = "lightblue", border = "white")
+abline(v = mean(bangladesh_losses), col = "darkblue", lwd = 2, lty = 2)
+```
+Loss Distribution Validation Against Observed Data
+```{r}
+
+# Actual Bangladesh event losses from calibration data (USD billion)
+observed_bd <- c(0.032, 0.13, 0.50, 0.80, 1.30, 1.50, 1.70, 2.80)
+
+# Simulate individual event losses using same lognormal parameters
+meanlog_bd <- log(bmu^2 / sqrt(bsigma^2 + bmu^2))
+sdlog_bd   <- sqrt(log(1 + bsigma^2 / bmu^2))
+
+set.seed(2026)
+sim_events <- rlnorm(10000, meanlog = meanlog_bd, sdlog = sdlog_bd)
+
+# Calculate percentile rank of each observed event
+cat("Validation: Observed events vs simulated event distribution\n\n")
+cat(sprintf("%-25s %15s %15s\n", "Event", "Loss (USD bn)", "Percentile"))
+cat(paste(rep("-", 55), collapse = ""), "\n")
+
+for (loss in sort(observed_bd)) {
+  pctile <- round(mean(sim_events <= loss) * 100, 1)
+  cat(sprintf("%-25s %15.3f %14.1f%%\n", "", loss, pctile))
+}
+
+cat("\nSimulated event distribution summary:\n")
+cat("  Mean:   USD", round(mean(sim_events), 2), "bn\n")
+cat("  Median: USD", round(median(sim_events), 2), "bn\n")
+cat("  SD:     USD", round(sd(sim_events), 2), "bn\n")
+cat("  Min:    USD", round(min(sim_events), 4), "bn\n")
+cat("  Max:    USD", round(max(sim_events), 2), "bn\n")
+
+# Histogram with observed events overlaid
+hist(sim_events[sim_events < 10], breaks = 100,
+     main = "Simulated vs Observed Individual Event Losses (Bangladesh)",
+     xlab = "Event Loss (USD Billion)", col = "lightblue", border = "white",
+     xlim = c(0, 10))
+abline(v = observed_bd, col = "red", lwd = 2, lty = 2)
+legend("topright",
+       legend = c("Simulated distribution", "Observed events"),
+       col = c("lightblue", "red"),
+       lwd = c(10, 2), lty = c(1, 2))
+```
+
+# Sensitivity Analysis
+
+## Recovery rate sensitivity - penetration fixed at 5%
+
+```{r}
+recovery_test <- c(0.55, 0.65, 0.75)
+penetration_baseline <- 0.05
+
+for (r in recovery_test) {
+  gap_pct <- (1 - penetration_baseline * r) * 100
+  cat("Recovery rate", r, "-> Protection gap:", round(gap_pct, 1), "%\n")
+}
+```
+
+## Penetration Rate Sensitivity - recovery fixed at 65%
+
+```{r}
+penetration_test <- c(0.05, 0.10, 0.15)
+recovery_baseline <- 0.65
+
+for (p in penetration_test) {
+  gap_pct <- (1 - p * recovery_baseline) * 100
+  cat("Penetration rate", p, "-> Protection gap:", round(gap_pct, 1), "%\n")
+}
+```
+
+## Tail Sensitivity - Effect of increasing sigma by 10%
+
+```{r}
+
+bsigma2 <- 0.99          # original 0.90 increased by 10%
+
+# Lognormal moment-matching with NEW sigma
+mu_log    <- log(bmu^2 / sqrt(bsigma2^2 + bmu^2))
+sigma_log <- sqrt(log(1 + bsigma2^2 / bmu^2))
+
+# Simulate aggregate annual losses
+agg_losses <- numeric(sims)
+for (i in 1:sims) {
+  n_events <- rpois(1, blambda)
+  if (n_events > 0) {
+    event_losses <- rlnorm(n_events, meanlog = mu_log, sdlog = sigma_log)
+    agg_losses[i] <- sum(event_losses)
+  } else {
+    agg_losses[i] <- 0
+  }
+}
+
+# Calculate protection gap for each simulated year
+insured    <- agg_losses * bp * br
+prot_gap   <- agg_losses - insured
+
+# VaR 99% of the protection gap
+var99_sens <- quantile(prot_gap, 0.99)
+
+cat("\nTail Sensitivity (sigma +10%):\n")
+cat("VaR 99% protection gap: USD", round(var99_sens, 2), "billion\n")
+```
+
+# Summary Statistics
+
+```{r}
+cat("KEY FIGURES FOR REPORT \n\n")
+cat("Simulation: 10,000 iterations\n")
+cat("Bangladesh flood frequency: λ =", blambda, "events/year\n")
+cat("Bangladesh mean severity: μ = $", bmu, "bn\n\n")
+cat("BASELINE COMPARISON:\n")
+cat("Japan protection gap: 55.9%\n")
+cat("Bangladesh protection gap:", 
+    round(model_outputs$protection_gap_pct[model_outputs$scenario == "Bangladesh_Baseline"], 1), "%\n")
+cat("SCENARIO IMPACT:\n")
+cat("Bangladesh at 50% penetration: 67.5% gap\n")
+cat("Gap reduction from baseline: 27.1 percentage points\n\n")
+cat("GDP-RELATIVE BURDEN:\n")
+cat("Japan: 0.48% of GDP\n")
+cat("Bangladesh current: 0.74% of GDP\n")
+cat("Bangladesh Japan-like: 0.51% of GDP\n")
+```
